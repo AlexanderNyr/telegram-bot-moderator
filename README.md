@@ -1,34 +1,62 @@
-# telegram-bot-moderator
-Telegram bot that automatically deletes messages with undesirable words in groups and notifies the chat with censored versions. Replies with functionality info in private messages.
+# Telegram Moderation Bot
+
+A powerful and flexible Telegram moderation bot with advanced admin tools, anti-spam protection, trigger-word filtering, warnings system, and detailed chat statistics.
 
 ---
 
 ## Features
 
-- **Private chats**: Replies with an explanation of its functionality.
-- **Group chats**: 
-  - Deletes messages containing trigger words.
-  - Sends a notification showing which words were removed, with all characters except the first and last replaced by `*` (censored).
-- **Trigger words** are stored in `trigger.txt` and can be customized.
-- **Token** is stored separately in `token.txt` for security.
+### Moderation
+- `/warn`, `/unwarn`, `/warns`, `/clearwarns`
+- `/mute`, `/unmute`
+- `/ban`, `/unban`
+- `/kick`
+
+### Trigger Words
+- `/addword`, `/addwords`
+- `/delword`
+- `/listwords`
+- `/clearwords`
+
+### Chat Settings
+- Enable/disable anti-spam
+- Enable/disable anti-links
+- Welcome messages
+- Max warnings limit
+- Custom messages
+
+### Statistics
+- Deleted messages
+- Warnings issued
+- Mutes, bans, kicks
+- Blocked spam and links
+
+### Permission System
+- Global bot administrators
+- Chat administrators
+- Chat creator
+- Protection from anonymous admin abuse
+
+### Security
+- Confirmation for sensitive actions
+- Thread-safe JSON storage
+- Logging system
 
 ---
 
 ## Installation
 
-1. Clone the repository:
-
+### 1. Clone the repository
 ```bash
 git clone https://github.com/AlexanderNyr/telegram-bot-moderator.git
 cd telegram-bot-moderator
 ````
-2. Create a file named token.txt in the repository folder and paste your bot token:
-1234567890:ABCdefGhIJKlmNoPQRstuVWXyz123456789
-
-3. Edit trigger.txt to add words that should be deleted (one per line).
-
-4. Install the required library:
+### 2. Install dependencies
+```bash
 pip install pyTelegramBotAPI
+````
+### 3. Add your bot token
+Paste your token from @BotFather into:
+token.txt
 
-5. Run the bot:
-python bot.py
+### 4. Add your Telegram id to 
