@@ -57,6 +57,10 @@ pip install pyTelegramBotAPI
 ````
 ### 3. Add your bot token
 Paste your token from @BotFather into:
-token.txt
+nano token.txt
 
-### 4. Add your Telegram id to 
+### 4. Add your trigger words in trigger.txt
+nano trigger.txt
+
+### 5. follow the command line instructions
+If it doesn't work, let me know in issules
