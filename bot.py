@@ -18,6 +18,7 @@ ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot: messages sent by anonymous
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "token.txt")
 TRIGGER_PATH = os.path.join(BASE_DIR, "trigger.txt")
+TRIGGERS_PATH = os.path.join(BASE_DIR, "triggers.json")  # per-chat trigger lists
 LOG_PATH = os.path.join(BASE_DIR, "log.txt")
 WARNS_PATH = os.path.join(BASE_DIR, "warns.json")
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")
@@ -245,6 +246,7 @@ LANGUAGES: Dict[str, Dict[str, str]] = {
         "links_removed": "🔗 Сообщение {user} удалено (ссылки запрещены)",
         "msg_deleted": "🚫 Сообщение от {user} удалено\n📛 Причина: {censored}",
         "no_delete_rights": "⚠️ Нет прав на удаление сообщений!",
+"need_admin_rights": "⚠️ Сделайте меня администратором группы (с правом удаления сообщений и блокировки), иначе модерация работать не будет",
     },
     "en": {
         # Access control
@@ -445,6 +447,7 @@ LANGUAGES: Dict[str, Dict[str, str]] = {
         "links_removed": "🔗 Message from {user} deleted (links are not allowed)",
         "msg_deleted": "🚫 Message from {user} deleted\n📛 Reason: {censored}",
         "no_delete_rights": "⚠️ Not enough rights to delete messages!",
+"need_admin_rights": "⚠️ Please make me a group administrator (with rights to delete messages and ban users), otherwise moderation will not work",
     },
 }
 
@@ -591,99 +594,133 @@ class JsonStorage:
 # Trigger word manager
 # ================================
 class TriggerManager:
-    """Thread-safe trigger word manager"""
+    """Thread-safe per-chat trigger word manager.
 
-    def __init__(self, filepath: str):
-        self.filepath = filepath
+    FIX: trigger words used to be one global list shared by every chat.
+    Now every chat has its own list; the words from trigger.txt are used
+    as the initial list the first time a chat is seen.
+    """
+
+    def __init__(self, filepath: str, storage_path: str):
+        self.filepath = filepath  # seed words for new chats
         self._lock = threading.RLock()
-        self._words: Set[str] = self._load()
-        self._patterns: List[tuple] = []
-        self._rebuild_cache()
+        self._storage = JsonStorage(storage_path, {})
+        self._seed: Set[str] = self._load_seed()
+        self._words: Dict[int, Set[str]] = self._load_all()
+        self._patterns: Dict[int, List[tuple]] = {}
+        self._rebuild_all()
 
-    def _load(self) -> Set[str]:
-        if not os.path.exists(self.filepath):
-            return set()
+    def _load_seed(self) -> Set[str]:
+        """Seed words from trigger.txt (applied to new chats)."""
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 return {line.strip().lower() for line in f if line.strip()}
-        except Exception as e:
-            print(f"⚠️ Failed to load trigger words: {e}")
+        except OSError:
             return set()
 
-    def _save(self) -> None:
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                f.write("\n".join(sorted(self._words)))
-        except Exception as e:
-            print(f"❌ Failed to save trigger words: {e}")
+    def _load_all(self) -> Dict[int, Set[str]]:
+        data = {}
+        for chat_id, words in self._storage.all().items():
+            try:
+                data[int(chat_id)] = {str(w).lower() for w in words}
+            except (TypeError, ValueError):
+                continue
+        return data
 
-    def _rebuild_cache(self) -> None:
+    def _save_chat(self, chat_id: int) -> None:
+        self._storage.set(chat_id, sorted(self._words.get(chat_id, ())))
+
+    def _ensure_chat(self, chat_id: int) -> Set[str]:
+        # FIX: a new chat starts from a copy of the trigger.txt seed words
+        if chat_id not in self._words:
+            self._words[chat_id] = set(self._seed)
+            self._save_chat(chat_id)
+            self._rebuild(chat_id)
+        return self._words[chat_id]
+
+    def seed_count(self) -> int:
+        return len(self._seed)
+
+    def _rebuild_all(self) -> None:
+        for chat_id in self._words:
+            self._rebuild(chat_id)
+
+    def _rebuild(self, chat_id: int) -> None:
         # FIX: match on word boundaries (plain substring matching caused false
         # positives: the trigger "cat" deleted messages containing "education")
-        self._patterns = [
+        words = self._words.get(chat_id, ())
+        self._patterns[chat_id] = [
             (w, re.compile(r"(?<!\w)" + re.escape(w) + r"(?!\w)"))
-            for w in self._words
+            for w in words
         ]
 
-    def add(self, word: str) -> bool:
+    def add(self, chat_id: int, word: str) -> bool:
         word = word.lower().strip()
         if not word:
             return False
         with self._lock:
-            if word in self._words:
+            words = self._ensure_chat(chat_id)
+            if word in words:
                 return False
-            self._words.add(word)
-            self._save()
-            self._rebuild_cache()
+            words.add(word)
+            self._save_chat(chat_id)
+            self._rebuild(chat_id)
             return True
 
-    def add_many(self, words: List[str]) -> int:
+    def add_many(self, chat_id: int, words: List[str]) -> int:
         added = 0
         with self._lock:
+            chat_words = self._ensure_chat(chat_id)
             for word in words:
                 word = word.lower().strip()
-                if word and word not in self._words:
-                    self._words.add(word)
+                if word and word not in chat_words:
+                    chat_words.add(word)
                     added += 1
             if added:
-                self._save()
-                self._rebuild_cache()
+                self._save_chat(chat_id)
+                self._rebuild(chat_id)
         return added
 
-    def remove(self, word: str) -> bool:
+    def remove(self, chat_id: int, word: str) -> bool:
         word = word.lower().strip()
         with self._lock:
-            if word not in self._words:
+            words = self._ensure_chat(chat_id)
+            if word not in words:
                 return False
-            self._words.discard(word)
-            self._save()
-            self._rebuild_cache()
+            words.discard(word)
+            self._save_chat(chat_id)
+            self._rebuild(chat_id)
             return True
 
-    def clear(self) -> int:
+    def clear(self, chat_id: int) -> int:
         with self._lock:
-            count = len(self._words)
-            self._words.clear()
-            self._save()
-            self._rebuild_cache()
+            self._ensure_chat(chat_id)
+            count = len(self._words[chat_id])
+            self._words[chat_id].clear()
+            self._save_chat(chat_id)
+            self._rebuild(chat_id)
             return count
 
-    def find_in_text(self, text: str) -> List[str]:
+    def find_in_text(self, chat_id: int, text: str) -> List[str]:
         text_lower = text.lower()
         with self._lock:
-            return [w for w, pattern in self._patterns if pattern.search(text_lower)]
+            self._ensure_chat(chat_id)
+            return [w for w, pattern in self._patterns.get(chat_id, []) if pattern.search(text_lower)]
 
-    def get_all(self) -> List[str]:
+    def get_all(self, chat_id: int) -> List[str]:
         with self._lock:
-            return sorted(self._words)
+            self._ensure_chat(chat_id)
+            return sorted(self._words[chat_id])
 
-    def count(self) -> int:
+    def count(self, chat_id: int) -> int:
         with self._lock:
-            return len(self._words)
+            self._ensure_chat(chat_id)
+            return len(self._words[chat_id])
 
-    def is_empty(self) -> bool:
+    def is_empty(self, chat_id: int) -> bool:
         with self._lock:
-            return len(self._words) == 0
+            self._ensure_chat(chat_id)
+            return len(self._words[chat_id]) == 0
 
 # ================================
 # Anti-spam manager
@@ -841,36 +878,42 @@ class SettingsManager:
 # User state manager
 # ================================
 class UserStateManager:
+    # FIX: states are keyed by (chat_id, user_id) — the /confirm flow used
+    # to leak between chats
     def __init__(self):
         self._lock = threading.Lock()
         self._states: dict = {}
 
-    def set_state(self, user_id: int, state: str, data: dict = None) -> None:
-        with self._lock:
-            self._states[user_id] = {"state": state, "data": data or {}}
+    def _key(self, chat_id: int, user_id: int) -> str:
+        return f"{chat_id}:{user_id}"
 
-    def get_state(self, user_id: int) -> Optional[dict]:
+    def set_state(self, chat_id: int, user_id: int, state: str, data: dict = None) -> None:
         with self._lock:
-            return self._states.get(user_id)
+            self._states[self._key(chat_id, user_id)] = {"state": state, "data": data or {}}
 
-    def clear(self, user_id: int) -> None:
+    def get_state(self, chat_id: int, user_id: int) -> Optional[dict]:
         with self._lock:
-            self._states.pop(user_id, None)
+            return self._states.get(self._key(chat_id, user_id))
 
-    def start_confirmation(self, user_id: int) -> None:
-        self.set_state(user_id, "confirm", {"count": 0})
-
-    def confirm(self, user_id: int) -> Optional[int]:
+    def clear(self, chat_id: int, user_id: int) -> None:
         with self._lock:
-            if user_id not in self._states or self._states[user_id]["state"] != "confirm":
+            self._states.pop(self._key(chat_id, user_id), None)
+
+    def start_confirmation(self, chat_id: int, user_id: int) -> None:
+        self.set_state(chat_id, user_id, "confirm", {"count": 0})
+
+    def confirm(self, chat_id: int, user_id: int) -> Optional[int]:
+        with self._lock:
+            state = self._states.get(self._key(chat_id, user_id))
+            if not state or state["state"] != "confirm":
                 return None
-            self._states[user_id]["data"]["count"] += 1
-            return self._states[user_id]["data"]["count"]
+            state["data"]["count"] += 1
+            return state["data"]["count"]
 
 # ================================
 # Manager initialization
 # ================================
-triggers = TriggerManager(TRIGGER_PATH)
+triggers = TriggerManager(TRIGGER_PATH, TRIGGERS_PATH)
 warns_storage = JsonStorage(WARNS_PATH, {})
 stats_storage = JsonStorage(STATS_PATH, {})
 settings_storage = JsonStorage(SETTINGS_PATH, {})
@@ -969,7 +1012,12 @@ def parse_duration(text: str) -> Optional[int]:
     value = int(match.group(1))
     unit = match.group(2)
     multipliers = {'m': 60, 'h': 3600, 'd': 86400, 'w': 604800}
-    return value * multipliers.get(unit, 60)
+    seconds = value * multipliers.get(unit, 60)
+    # FIX: reject zero durations ("0m" used to "mute" for 0 seconds) and
+    # values Telegram cannot accept (until_date must be under ~366 days)
+    if seconds < 60 or seconds > 365 * 86400:
+        return None
+    return seconds
 
 def format_duration(seconds: int, lang: str) -> str:
     if seconds < 60:
@@ -1017,6 +1065,21 @@ def extract_user_from_message(message) -> tuple:
 
     return None, reason
 
+LINK_TLDS = (
+    # FIX: a much wider curated TLD list (the old short list was bypassed
+    # with e.g. .de, .fr or .pl links)
+    "com", "net", "org", "ru", "su", "ua", "by", "kz", "io", "me", "info",
+    "biz", "xyz", "top", "site", "online", "store", "app", "dev", "pro",
+    "tv", "рф",
+    "de", "fr", "it", "es", "pl", "nl", "se", "cz", "sk", "fi", "no", "dk",
+    "pt", "gr", "ro", "bg", "hu", "at", "ch", "be", "lt", "lv", "ee", "md",
+    "ge", "am", "az", "uz", "tj", "tm", "kg", "il", "tr", "cn", "jp", "kr",
+    "in", "id", "th", "vn", "ph", "my", "sg", "hk", "tw", "br", "ar", "cl",
+    "co", "mx", "pe", "ve", "ca", "us", "uk", "au", "nz", "za", "ng", "eg",
+    "ma", "club", "life", "live", "world", "today", "email", "link", "icu",
+    "cam", "fun", "pw", "cc", "ws", "fm", "ai", "tech", "space", "vip", "one",
+)
+
 LINK_PATTERNS = [
     r'https?://\S+',
     r'tg://\S+',
@@ -1026,7 +1089,7 @@ LINK_PATTERNS = [
     r'(?<![\w.])telegram\.dog/\S+',
     r'(?<![\w.])joinchat\.to/\S+',
     # a domain without a protocol, including subdomains: site.ru, sub.site.online, etc.
-    r'(?:(?<=\s)|^)(?:[a-z0-9-]+\.)+(?:com|net|org|ru|su|ua|by|kz|io|me|info|biz|xyz|top|site|online|store|app|dev|pro|tv|рф)(?![\w-])',
+    r'(?:(?<=\s)|^)(?:[a-z0-9-]+\.)+(?:' + "|".join(sorted(LINK_TLDS)) + r')(?![\w-])',
 ]
 
 def has_links(text: str) -> bool:
@@ -1035,6 +1098,17 @@ def has_links(text: str) -> bool:
     for pattern in LINK_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
+    return False
+
+def message_has_link_entities(message) -> bool:
+    """FIX: detect links via Telegram entities as well — covers captions and
+    inline links (text_link) that the plain-text regex cannot see."""
+    for entities in (message.entities, message.caption_entities):
+        if not entities:
+            continue
+        for entity in entities:
+            if entity.type in ("url", "text_link"):
+                return True
     return False
 
 # ================================
@@ -1287,10 +1361,10 @@ def callback_handler(call):
 
         elif call.data == "list_words":
             bot.answer_callback_query(call.id)
-            user_states.start_confirmation(user_id)
+            user_states.start_confirmation(chat_id, user_id)
             bot.send_message(
                 chat_id,
-                tr(lang, "confirm_title", count=triggers.count()),
+                tr(lang, "confirm_title", count=triggers.count(chat_id)),
                 parse_mode="Markdown"
             )
 
@@ -1400,7 +1474,7 @@ def cmd_confirm(message):
     chat_id = message.chat.id
     lang = get_lang(chat_id)
 
-    count = user_states.confirm(user_id)
+    count = user_states.confirm(chat_id, user_id)
 
     if count is None:
         bot.reply_to(message, tr(lang, "confirm_not_started"))
@@ -1410,11 +1484,11 @@ def cmd_confirm(message):
         bot.reply_to(message, tr(lang, "confirm_progress", count=count))
         return
 
-    words = triggers.get_all()
+    words = triggers.get_all(chat_id)
 
     if not words:
         bot.send_message(chat_id, tr(lang, "triggers_empty"))
-        user_states.clear(user_id)
+        user_states.clear(chat_id, user_id)
         return
 
     temp_file = os.path.join(BASE_DIR, f"triggers_{user_id}.txt")
@@ -1428,7 +1502,7 @@ def cmd_confirm(message):
     finally:
         if os.path.exists(temp_file):
             os.remove(temp_file)
-        user_states.clear(user_id)
+        user_states.clear(chat_id, user_id)
 
 # ================================
 # Trigger word commands
@@ -1447,7 +1521,7 @@ def cmd_addword(message):
         bot.reply_to(message, tr(lang, "word_too_long"))
         return
 
-    if triggers.add(word):
+    if triggers.add(message.chat.id, word):
         bot.reply_to(message, tr(lang, "word_added", word=md_escape(word.lower())), parse_mode="Markdown")
     else:
         bot.reply_to(message, tr(lang, "word_exists"))
@@ -1461,7 +1535,7 @@ def cmd_addwords(message):
         bot.reply_to(message, tr(lang, "addwords_usage"), parse_mode="Markdown")
         return
 
-    added = triggers.add_many(parts)
+    added = triggers.add_many(message.chat.id, parts)
     bot.reply_to(message, tr(lang, "addwords_done", count=added))
 
 @bot.message_handler(commands=["delword"])
@@ -1474,7 +1548,7 @@ def cmd_delword(message):
         return
 
     word = parts[1].strip()
-    if triggers.remove(word):
+    if triggers.remove(message.chat.id, word):
         bot.reply_to(message, tr(lang, "word_deleted", word=md_escape(word.lower())), parse_mode="Markdown")
     else:
         bot.reply_to(message, tr(lang, "word_not_found"))
@@ -1483,17 +1557,17 @@ def cmd_delword(message):
 @creator_only
 def cmd_clearwords(message):
     lang = get_lang(message.chat.id)
-    count = triggers.clear()
+    count = triggers.clear(message.chat.id)
     bot.reply_to(message, tr(lang, "clearwords_done", count=count))
 
 @bot.message_handler(commands=["listwords"])
 @admin_only
 def cmd_listwords(message):
     lang = get_lang(message.chat.id)
-    user_states.start_confirmation(message.from_user.id)
+    user_states.start_confirmation(message.chat.id, message.from_user.id)
     bot.send_message(
         message.chat.id,
-        tr(lang, "listwords_confirm", count=triggers.count())
+        tr(lang, "listwords_confirm", count=triggers.count(message.chat.id))
     )
 
 # ================================
@@ -1604,20 +1678,16 @@ def cmd_clearwarns(message):
 def cmd_mute(message):
     lang = get_lang(message.chat.id)
     parts = message.text.split() if message.text else []
-    duration_str = None
-    user = None
 
     if message.reply_to_message and message.reply_to_message.from_user:
         user = message.reply_to_message.from_user
-        if len(parts) > 1:
-            duration_str = parts[1]
+        rest = parts[1:]
     else:
         if len(parts) < 2:
             bot.reply_to(message, tr(lang, "mute_usage"), parse_mode="Markdown")
             return
         user, _ = extract_user_from_message(message)
-        if len(parts) > 2:
-            duration_str = parts[2]
+        rest = parts[2:]
 
     if not user:
         bot.reply_to(message, tr(lang, "user_not_found"))
@@ -1627,11 +1697,20 @@ def cmd_mute(message):
         bot.reply_to(message, tr(lang, "target_admin_mute"))
         return
 
-    if duration_str:
-        duration = parse_duration(duration_str)
+    # FIX: the first argument is a duration only when it looks like one
+    # (\d+[mhdw]); with or without a duration the remaining text is the reason
+    duration = None
+    reason = None
+    if rest and re.match(r'^\d+[mhdw]$', rest[0].lower()):
+        duration = parse_duration(rest[0])
         if not duration:
             bot.reply_to(message, tr(lang, "bad_duration"))
             return
+        reason = " ".join(rest[1:]) or None
+    elif rest:
+        reason = " ".join(rest) or None
+
+    if duration:
         until_date = datetime.now() + timedelta(seconds=duration)
         duration_text = format_duration(duration, lang)
     else:
@@ -1646,14 +1725,16 @@ def cmd_mute(message):
             permissions=get_mute_permissions()
         )
 
-        bot.send_message(
-            message.chat.id,
-            tr(lang, "muted", user=get_user_display(user), duration=duration_text)
-        )
+        text = tr(lang, "muted", user=get_user_display(user), duration=duration_text)
+        if reason:
+            text += tr(lang, "ban_reason_line", reason=reason)
+
+        bot.send_message(message.chat.id, text)
         stats.increment(message.chat.id, "mutes")
 
     except Exception as e:
         bot.reply_to(message, tr(lang, "action_error", error=e))
+
 
 @bot.message_handler(commands=["unmute"])
 @group_only
@@ -1866,12 +1947,21 @@ def cmd_clear(message):
             return
 
         deleted = 0
-        for i in range(count + 1):
+        attempts = 0
+        consecutive_misses = 0
+        # FIX: message IDs in supergroups are not contiguous — keep walking
+        # back until enough messages are deleted or a long gap is reached
+        while deleted < count + 1 and attempts < count + 100 and consecutive_misses < 10:
+            target_id = message.message_id - attempts
+            attempts += 1
+            if target_id < 1:
+                break
             try:
-                bot.delete_message(message.chat.id, message.message_id - i)
+                bot.delete_message(message.chat.id, target_id)
                 deleted += 1
+                consecutive_misses = 0
             except Exception:
-                continue
+                consecutive_misses += 1
 
         # FIX: count deleted messages in the statistics
         stats.increment(message.chat.id, "deleted_messages", deleted)
@@ -1997,8 +2087,31 @@ def cmd_setgoodbye(message):
 # ================================
 # New/left chat members
 # ================================
+BOT_INFO = None  # cached get_me() result
+
+
+def get_bot_id() -> Optional[int]:
+    """FIX: recognize the bot itself to warn when it lacks admin rights."""
+    global BOT_INFO
+    if BOT_INFO is None:
+        try:
+            BOT_INFO = bot.get_me()
+        except Exception:
+            return None
+    return BOT_INFO.id
+
+
 @bot.message_handler(content_types=["new_chat_members"])
 def handle_new_member(message):
+    # FIX: warn when the bot is added to a group without admin rights
+    bot_id = get_bot_id()
+    if bot_id is not None and any(u.is_bot and u.id == bot_id for u in message.new_chat_members):
+        try:
+            me = bot.get_chat_member(message.chat.id, bot_id)
+            if me.status != "administrator":
+                bot.send_message(message.chat.id, tr(get_lang(message.chat.id), "need_admin_rights"))
+        except Exception:
+            pass
     if not settings.get(message.chat.id, "welcome_enabled"):
         return
 
@@ -2035,23 +2148,31 @@ def handle_left_member(message):
 # ================================
 # Message handling
 # ================================
-@bot.message_handler(func=lambda m: True, content_types=["text"])
+MEDIA_CONTENT_TYPES = [
+    # FIX: captions of photos/videos/etc. are moderated too, not only text
+    "text", "photo", "video", "document", "audio", "voice",
+    "video_note", "sticker", "animation",
+]
+
+
+@bot.message_handler(func=lambda m: True, content_types=MEDIA_CONTENT_TYPES)
 def handle_message(message):
     # Private messages
     if is_private(message):
         bot.send_message(message.chat.id, tr(get_lang(message.chat.id), "private_hello"))
         return
 
-    if not is_group(message) or not message.text:
+    if not is_group(message):
         return
 
     chat_id = message.chat.id
     user_id = message.from_user.id
     lang = get_lang(chat_id)
-    text = message.text.strip()
+    # FIX: captions are checked too, not only plain text
+    text = (message.text or message.caption or "").strip()
 
     # Liveness check
-    if text.lower() in ("бот", "bot"):
+    if message.text and text.lower() in ("бот", "bot"):
         bot.send_message(chat_id, tr(lang, "im_working"))
         return
 
@@ -2059,7 +2180,7 @@ def handle_message(message):
     if can_moderate(chat_id, user_id):
         return
 
-    # Anti-spam
+    # Anti-spam (any message type counts towards the flood limit)
     if settings.get(chat_id, "antispam_enabled"):
         max_msg = settings.get(chat_id, "antispam_messages")
         seconds = settings.get(chat_id, "antispam_seconds")
@@ -2085,8 +2206,8 @@ def handle_message(message):
             except Exception as e:
                 print(f"❌ Anti-spam error: {e}")
 
-    # Anti-links
-    if settings.get(chat_id, "antilink_enabled") and has_links(text):
+    # Anti-links (regex on the text/caption + Telegram link entities)
+    if settings.get(chat_id, "antilink_enabled") and (has_links(text) or message_has_link_entities(message)):
         try:
             bot.delete_message(chat_id, message.message_id)
             bot.send_message(
@@ -2100,7 +2221,10 @@ def handle_message(message):
             print(f"❌ Anti-link error: {e}")
 
     # Trigger words
-    found_words = triggers.find_in_text(text)
+    if not text:
+        return
+
+    found_words = triggers.find_in_text(chat_id, text)
 
     if not found_words:
         return
@@ -2132,13 +2256,14 @@ def handle_message(message):
     except Exception as e:
         print(f"❌ Error: {e}")
 
+
 # ================================
 # Startup
 # ================================
 def main():
     print("=" * 50)
     print("🤖 Moderation bot started!")
-    print(f"📁 Trigger words: {triggers.count()}")
+    print(f"📁 Trigger seed words (trigger.txt): {triggers.seed_count()}")
     print(f"🌐 Default language: {lang_name(DEFAULT_LANG)} ({DEFAULT_LANG})")
     print(f"📁 Logs: {LOG_PATH}")
     print("=" * 50)

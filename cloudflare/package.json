@@ -1,0 +1,7 @@
+{
+  "name": "telegram-moderation-bot-worker",
+  "version": "1.0.0",
+  "description": "Telegram moderation bot for Cloudflare Workers (webhook + D1)",
+  "type": "module",
+  "private": true
+}

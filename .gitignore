@@ -9,3 +9,7 @@ triggers_*.txt
 # Python
 __pycache__/
 *.pyc
+
+# Runtime data (per-chat trigger lists)
+triggers.json
+node_modules/

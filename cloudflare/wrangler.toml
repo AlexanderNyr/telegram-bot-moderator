@@ -1,0 +1,19 @@
+name = "telegram-moderation-bot"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+# Default interface language ("ru" or "en") — same role as lang.txt in the Python version.
+# Each chat can still switch its own language via /lang.
+[vars]
+DEFAULT_LANG = "ru"
+# Optional: words used to seed a chat's trigger list the first time the chat
+# is used (same role as trigger.txt in the Python version). Comma/newline separated.
+# SEED_TRIGGER_WORDS = "спам, казино, http"
+
+# 1) Create the database first:      npx wrangler d1 create tgmoderation
+# 2) Paste its database_id below, then:
+#    npx wrangler d1 execute tgmoderation --remote --file=schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "tgmoderation"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"

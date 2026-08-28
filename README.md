@@ -17,6 +17,7 @@ A powerful and flexible Telegram moderation bot with advanced admin tools, anti-
 - `/delword`
 - `/listwords`
 - `/clearwords`
+- Trigger lists are **per chat**: `trigger.txt` is used as the initial word list for every new chat, and `/addword`/`/delword`/`/clearwords` only affect the chat where they are used
 
 ### Chat Settings
 - Enable/disable anti-spam
@@ -25,6 +26,11 @@ A powerful and flexible Telegram moderation bot with advanced admin tools, anti-
 - Max warnings limit
 - Custom messages
 - Bot language: Russian/English (`/lang` in a chat or `lang.txt` for the default)
+
+### Message filtering
+- Anti-spam and anti-links also check **captions** of photos/videos/documents, not only plain text
+- Anti-links detect links via Telegram entities and a wide TLD list (`.de`, `.fr`, `.pl`, etc.)
+- `/mute` accepts a reason with or without a duration: `/mute 1h flooding` or reply + `/mute be polite`
 
 ### Statistics
 - Deleted messages
@@ -43,6 +49,25 @@ A powerful and flexible Telegram moderation bot with advanced admin tools, anti-
 - Logging system
 
 ---
+
+## Deploy to Cloudflare Workers (free)
+
+The repository includes a webhook-based **Cloudflare Workers edition** (JavaScript + D1) with the same commands, localization (RU/EN) and features. It runs entirely on the free tier:
+
+- Workers Free: 100,000 requests/day (updates), 10 ms CPU per request
+- D1 Free: 5 million rows read/day, 100,000 rows written/day, 5 GB storage
+
+```bash
+cd cloudflare
+npx wrangler login
+npx wrangler d1 create tgmoderation     # paste database_id into wrangler.toml
+npx wrangler d1 execute tgmoderation --remote --file=schema.sql
+npx wrangler secret put BOT_TOKEN       # token from @BotFather
+npx wrangler secret put WEBHOOK_SECRET  # any random string
+npx wrangler deploy
+```
+
+Then open `https://<worker-url>/setup?key=<WEBHOOK_SECRET>` once to register the Telegram webhook. Full instructions: [`cloudflare/README.md`](cloudflare/README.md).
 
 ## Installation
 
