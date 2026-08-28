@@ -24,6 +24,7 @@ A powerful and flexible Telegram moderation bot with advanced admin tools, anti-
 - Welcome messages
 - Max warnings limit
 - Custom messages
+- Bot language: Russian/English (`/lang` in a chat or `lang.txt` for the default)
 
 ### Statistics
 - Deleted messages
@@ -61,5 +62,12 @@ nano token.txt
 ### 4. Add your trigger words in trigger.txt
 nano trigger.txt
 
-### 5. follow the command line instructions
+### 5. Choose the bot language (optional)
+The default language is Russian. To switch the whole bot to English:
+```bash
+echo en > lang.txt
+```
+Each chat can also pick its own language with the `/lang` command (chat admins only).
+
+### 6. follow the command line instructions
 If it doesn't work, let me know in issues
