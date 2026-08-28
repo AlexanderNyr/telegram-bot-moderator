@@ -10,7 +10,7 @@ import threading
 from functools import wraps
 from typing import Optional, List, Set, Dict, Any
 
-ANONYMOUS_ADMIN_ID = 
+ANONYMOUS_ADMIN_ID = 1087968824  # GroupAnonymousBot — сообщения от анонимных админов
 
 # ================================
 # Конфигурация
@@ -22,7 +22,6 @@ LOG_PATH = os.path.join(BASE_DIR, "log.txt")
 WARNS_PATH = os.path.join(BASE_DIR, "warns.json")
 STATS_PATH = os.path.join(BASE_DIR, "stats.json")
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
-ADMINS_PATH = os.path.join(BASE_DIR, "admins.json")
 
 # Настройки по умолчанию
 DEFAULT_SETTINGS = {
@@ -44,9 +43,16 @@ DEFAULT_SETTINGS = {
 def load_token() -> str:
     try:
         with open(TOKEN_PATH, "r", encoding="utf-8") as f:
-            return f.read().strip()
+            token = f.read().strip()
     except FileNotFoundError:
         raise FileNotFoundError(f"❌ Файл токена не найден: {TOKEN_PATH}")
+    # ИСПРАВЛЕНИЕ: понятная ошибка вместо загадочного 401 Unauthorized от API
+    if not token or token == "PASTE_YOUR_BOT_TOKEN_HERE":
+        raise ValueError(
+            "❌ В token.txt не указан токен бота.\n"
+            "   Получите токен у @BotFather и вставьте его в token.txt"
+        )
+    return token
 
 TOKEN = load_token()
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
@@ -68,17 +74,28 @@ class JsonStorage:
             return self.default.copy() if isinstance(self.default, dict) else self.default
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
+                content = f.read().strip()
+            # ИСПРАВЛЕНИЕ: пустой файл — не ошибка, используем значения по умолчанию
+            if not content:
+                return self.default.copy() if isinstance(self.default, dict) else self.default
+            return json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             print(f"⚠️ Ошибка загрузки {self.filepath}: {e}")
             return self.default.copy() if isinstance(self.default, dict) else self.default
     
     def _save(self) -> None:
+        # ИСПРАВЛЕНИЕ: атомарная запись (tmp + os.replace), файл не повредится при сбое
+        tmp_path = self.filepath + ".tmp"
         try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.filepath)
         except Exception as e:
             print(f"❌ Ошибка сохранения {self.filepath}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
     
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
@@ -88,6 +105,14 @@ class JsonStorage:
         with self._lock:
             self._data[str(key)] = value
             self._save()
+    
+    def mutate(self, key: str, fn) -> Any:
+        """ИСПРАВЛЕНИЕ: атомарное чтение-изменение-запись под общей блокировкой"""
+        with self._lock:
+            result = fn(self._data.get(str(key)))
+            self._data[str(key)] = result
+            self._save()
+            return result
     
     def delete(self, key: str) -> bool:
         with self._lock:
@@ -125,63 +150,6 @@ class JsonStorage:
             return self._data.copy()
 
 # ================================
-# Менеджер администраторов бота
-# ================================
-class BotAdminsManager:
-    """Управление администраторами бота (глобальные права)"""
-    
-    def __init__(self, filepath: str):
-        self.filepath = filepath
-        self._lock = threading.RLock()
-        self._admins: Set[int] = self._load()
-    
-    def _load(self) -> Set[int]:
-        if not os.path.exists(self.filepath):
-            return set()
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return set(data.get("admins", []))
-        except Exception as e:
-            print(f"⚠️ Ошибка загрузки админов бота: {e}")
-            return set()
-    
-    def _save(self) -> None:
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump({"admins": list(self._admins)}, f, indent=2)
-        except Exception as e:
-            print(f"❌ Ошибка сохранения админов бота: {e}")
-    
-    def add(self, user_id: int) -> bool:
-        with self._lock:
-            if user_id in self._admins:
-                return False
-            self._admins.add(user_id)
-            self._save()
-            return True
-    
-    def remove(self, user_id: int) -> bool:
-        with self._lock:
-            if user_id not in self._admins:
-                return False
-            self._admins.discard(user_id)
-            self._save()
-            return True
-    
-    def is_admin(self, user_id: int) -> bool:
-        with self._lock:
-            return user_id in self._admins
-    
-    def get_all(self) -> List[int]:
-        with self._lock:
-            return list(self._admins)
-    
-    def count(self) -> int:
-        with self._lock:
-            return len(self._admins)
-
-# ================================
 # Менеджер триггер-слов
 # ================================
 class TriggerManager:
@@ -191,6 +159,8 @@ class TriggerManager:
         self.filepath = filepath
         self._lock = threading.RLock()
         self._words: Set[str] = self._load()
+        self._patterns: List[tuple] = []
+        self._rebuild_cache()
     
     def _load(self) -> Set[str]:
         if not os.path.exists(self.filepath):
@@ -209,6 +179,14 @@ class TriggerManager:
         except Exception as e:
             print(f"❌ Ошибка сохранения триггеров: {e}")
     
+    def _rebuild_cache(self) -> None:
+        # ИСПРАВЛЕНИЕ: поиск по границам слова (подстрока давала ложные срабатывания:
+        # триггер "cat" удалял сообщения со словом "education")
+        self._patterns = [
+            (w, re.compile(r"(?<!\w)" + re.escape(w) + r"(?!\w)"))
+            for w in self._words
+        ]
+    
     def add(self, word: str) -> bool:
         word = word.lower().strip()
         if not word:
@@ -218,6 +196,7 @@ class TriggerManager:
                 return False
             self._words.add(word)
             self._save()
+            self._rebuild_cache()
             return True
     
     def add_many(self, words: List[str]) -> int:
@@ -230,6 +209,7 @@ class TriggerManager:
                     added += 1
             if added:
                 self._save()
+                self._rebuild_cache()
         return added
     
     def remove(self, word: str) -> bool:
@@ -239,6 +219,7 @@ class TriggerManager:
                 return False
             self._words.discard(word)
             self._save()
+            self._rebuild_cache()
             return True
     
     def clear(self) -> int:
@@ -246,12 +227,13 @@ class TriggerManager:
             count = len(self._words)
             self._words.clear()
             self._save()
+            self._rebuild_cache()
             return count
     
     def find_in_text(self, text: str) -> List[str]:
         text_lower = text.lower()
         with self._lock:
-            return [w for w in self._words if w in text_lower]
+            return [w for w, pattern in self._patterns if pattern.search(text_lower)]
     
     def get_all(self) -> List[str]:
         with self._lock:
@@ -280,14 +262,20 @@ class AntiSpamManager:
         now = time.time()
         
         with self._lock:
-            self._messages[key] = [t for t in self._messages[key] if now - t < seconds]
-            self._messages[key].append(now)
-            return len(self._messages[key]) > max_messages
-    
-    def reset(self, chat_id: int, user_id: int) -> None:
-        key = f"{chat_id}:{user_id}"
-        with self._lock:
-            self._messages.pop(key, None)
+            # ИСПРАВЛЕНИЕ: периодическая чистка неактивных ключей —
+            # раньше словарь рос бесконечно (утечка памяти)
+            if len(self._messages) > 512:
+                cleaned = {}
+                for k, timestamps in self._messages.items():
+                    fresh = [t for t in timestamps if now - t < seconds]
+                    if fresh:
+                        cleaned[k] = fresh
+                self._messages = defaultdict(list, cleaned)
+            
+            history = [t for t in self._messages[key] if now - t < seconds]
+            history.append(now)
+            self._messages[key] = history
+            return len(history) > max_messages
 
 # ================================
 # Менеджер предупреждений
@@ -298,43 +286,68 @@ class WarnsManager:
     def __init__(self, storage: JsonStorage):
         self.storage = storage
     
+    def _active(self, chat_id: int, warns_list: Optional[List[dict]]) -> List[dict]:
+        """ИСПРАВЛЕНИЕ: учитываем настройку warn_expire_days — старые варны сгорают"""
+        days = settings.get(chat_id, "warn_expire_days") or 0
+        if days <= 0 or not warns_list:
+            return warns_list or []
+        limit = datetime.now() - timedelta(days=days)
+        active = []
+        for w in warns_list:
+            try:
+                if datetime.fromisoformat(w.get("date", "")) >= limit:
+                    active.append(w)
+            except (ValueError, TypeError):
+                active.append(w)  # повреждённая дата — оставляем
+        return active
+    
     def add_warn(self, chat_id: int, user_id: int, reason: str, by_user_id: int) -> int:
         key = f"{chat_id}:{user_id}"
-        warns = self.storage.get(key, [])
-        warns.append({
-            "reason": reason,
-            "by": by_user_id,
-            "date": datetime.now().isoformat()
-        })
-        self.storage.set(key, warns)
-        return len(warns)
+        holder = {"count": 0}
+        
+        def _add(current: Optional[List[dict]]) -> List[dict]:
+            items = self._active(chat_id, current or [])
+            items.append({
+                "reason": reason,
+                "by": by_user_id,
+                "date": datetime.now().isoformat()
+            })
+            holder["count"] = len(items)
+            return items
+        
+        # ИСПРАВЛЕНИЕ: атомарно под блокировкой хранилища (раньше была гонка get/set)
+        self.storage.mutate(key, _add)
+        return holder["count"]
     
     def remove_warn(self, chat_id: int, user_id: int, index: int = -1) -> bool:
         key = f"{chat_id}:{user_id}"
-        warns = self.storage.get(key, [])
-        if not warns:
-            return False
-        try:
-            warns.pop(index)
-            self.storage.set(key, warns)
-            return True
-        except IndexError:
-            return False
+        holder = {"removed": False}
+        
+        def _remove(current: Optional[List[dict]]) -> List[dict]:
+            items = self._active(chat_id, current or [])
+            if items:
+                items.pop(index)
+                holder["removed"] = True
+            return items
+        
+        self.storage.mutate(key, _remove)
+        return holder["removed"]
     
     def clear_warns(self, chat_id: int, user_id: int) -> int:
-        key = f"{chat_id}:{user_id}"
-        warns = self.storage.get(key, [])
-        count = len(warns)
-        self.storage.delete(key)
+        count = len(self.get_warns(chat_id, user_id))
+        if count:
+            self.storage.delete(f"{chat_id}:{user_id}")
         return count
     
     def get_warns(self, chat_id: int, user_id: int) -> List[dict]:
-        key = f"{chat_id}:{user_id}"
-        return self.storage.get(key, [])
+        raw = self.storage.get(f"{chat_id}:{user_id}", [])
+        return self._active(chat_id, raw)
     
     def count_warns(self, chat_id: int, user_id: int) -> int:
         return len(self.get_warns(chat_id, user_id))
 
+# ================================
+# Менеджер статистики
 # ================================
 # Менеджер статистики
 # ================================
@@ -345,8 +358,12 @@ class StatsManager:
         self.storage = storage
     
     def increment(self, chat_id: int, stat_type: str, count: int = 1) -> None:
-        current = self.storage.get_nested(str(chat_id), stat_type, default=0)
-        self.storage.set_nested(str(chat_id), stat_type, value=current + count)
+        # ИСПРАВЛЕНИЕ: атомарный инкремент под блокировкой (раньше терялись значения при гонке)
+        def _inc(current: Optional[dict]) -> dict:
+            current = current or {}
+            current[stat_type] = current.get(stat_type, 0) + count
+            return current
+        self.storage.mutate(str(chat_id), _inc)
     
     def get_stats(self, chat_id: int) -> dict:
         return self.storage.get(str(chat_id), {
@@ -428,16 +445,23 @@ stats = StatsManager(stats_storage)
 settings = SettingsManager(settings_storage)
 antispam = AntiSpamManager()
 user_states = UserStateManager()
-bot_admins = BotAdminsManager(ADMINS_PATH)
 
 # ================================
 # Логирование
 # ================================
 _log_lock = threading.Lock()
 
+MAX_LOG_SIZE = 5 * 1024 * 1024  # 5 МБ
+
 def write_log(text: str) -> None:
     try:
         with _log_lock:
+            # ИСПРАВЛЕНИЕ: простая ротация — log.txt не растёт бесконечно
+            try:
+                if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > MAX_LOG_SIZE:
+                    os.replace(LOG_PATH, LOG_PATH + ".old")
+            except OSError:
+                pass
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(f"{text}\n")
     except Exception as e:
@@ -446,6 +470,11 @@ def write_log(text: str) -> None:
 # ================================
 # Утилиты
 # ================================
+def md_escape(text: Any) -> str:
+    """ИСПРАВЛЕНИЕ: экранирование спецсимволов Markdown в пользовательских данных
+    (имя или причина с _ * [ раньше ломали отправку сообщений с parse_mode=Markdown)"""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
 def censor_word(word: str) -> str:
     length = len(word)
     if length <= 1:
@@ -461,6 +490,12 @@ def is_chat_admin(chat_id: int, user_id: int) -> bool:
         return member.status in ("creator", "administrator")
     except Exception:
         return False
+
+def can_moderate(chat_id: int, user_id: int) -> bool:
+    """Права модератора: анонимный админ группы, админ или создатель чата"""
+    if user_id == ANONYMOUS_ADMIN_ID:
+        return True
+    return is_chat_admin(chat_id, user_id)
 
 def is_creator(chat_id: int, user_id: int) -> bool:
     try:
@@ -479,10 +514,6 @@ def get_user_display(user) -> str:
     if user.username:
         return f"@{user.username}"
     return user.first_name or f"ID:{user.id}"
-
-def get_user_link(user) -> str:
-    name = user.first_name or f"ID:{user.id}"
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
 def parse_duration(text: str) -> Optional[int]:
     match = re.match(r'^(\d+)([mhdw])$', text.lower())
@@ -529,28 +560,31 @@ def extract_user_from_message(message) -> tuple:
     if user_arg.startswith("@"):
         user_arg = user_arg[1:]
     
-    # Пытаемся найти через entities
+    # Пытаемся найти через entities (text_mention — упоминание юзера без @username).
+    # Обычный @username разрешить нельзя: Bot API не позволяет найти ID по имени.
     if message.entities:
         for entity in message.entities:
-            if entity.type == "mention":
-                mention_text = message.text[entity.offset:entity.offset + entity.length]
-                if mention_text.startswith("@"):
-                    mention_text = mention_text[1:]
-                # К сожалению, Telegram API не позволяет получить user_id по username напрямую
-                # Возвращаем None, пользователь должен использовать reply или ID
-                pass
-            elif entity.type == "text_mention" and entity.user:
+            if entity.type == "text_mention" and entity.user:
                 return entity.user, reason
     
     return None, reason
 
+LINK_PATTERNS = [
+    r'https?://\S+',
+    r'tg://\S+',
+    r'(?<![\w.])www\.\S+',
+    r'(?<![\w.])t\.me/\S+',
+    r'(?<![\w.])telegram\.me/\S+',
+    r'(?<![\w.])telegram\.dog/\S+',
+    r'(?<![\w.])joinchat\.to/\S+',
+    # домен без протокола, включая поддомены: site.ru, sub.site.online и т.п.
+    r'(?:(?<=\s)|^)(?:[a-z0-9-]+\.)+(?:com|net|org|ru|su|ua|by|kz|io|me|info|biz|xyz|top|site|online|store|app|dev|pro|tv|рф)(?![\w-])',
+]
+
 def has_links(text: str) -> bool:
-    patterns = [
-        r'https?://\S+',
-        r't\.me/\S+',
-        r'telegram\.me/\S+',
-    ]
-    for pattern in patterns:
+    # ИСПРАВЛЕНИЕ: расширенный список шаблонов (раньше обходилось через
+    # "www.", "tg://", домен без протокола и telegram.dog)
+    for pattern in LINK_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
@@ -619,39 +653,17 @@ def get_unmute_permissions() -> types.ChatPermissions:
 # ================================
 # Декораторы
 # ================================
-def bot_admin_only(func):
-    """Только для глобальных администраторов бота"""
-    @wraps(func)
-    def wrapper(message, *args, **kwargs):
-        user_id = message.from_user.id
-        
-        if bot_admins.is_admin(user_id):
-            return func(message, *args, **kwargs)
-        
-        # Анонимный админ — проверяем, может он в списке по-другому
-        # Но для bot_admin_only нужен реальный ID, так что отказываем
-        if user_id == ANONYMOUS_ADMIN_ID:
-            bot.reply_to(message, "⛔ Отключите анонимность для использования этой команды")
-            return
-        
-        bot.reply_to(message, "⛔ Только для администраторов бота")
-    return wrapper
-
 def admin_only(func):
-    """Для админов чата ИЛИ глобальных админов бота"""
+    """Для админов чата (включая анонимных админов группы)"""
     @wraps(func)
     def wrapper(message, *args, **kwargs):
         user_id = message.from_user.id
         
-        # Глобальный админ бота
-        if bot_admins.is_admin(user_id):
-            return func(message, *args, **kwargs)
-        
-        # Анонимный админ группы — он точно админ чата
+        # Анонимный админ группы — точно админ чата
         if user_id == ANONYMOUS_ADMIN_ID:
             return func(message, *args, **kwargs)
         
-        # В личке разрешаем только глобальным админам
+        # В личке команды модерации недоступны
         if is_private(message):
             bot.reply_to(message, "⛔ Нет доступа")
             return
@@ -664,13 +676,10 @@ def admin_only(func):
     return wrapper
 
 def creator_only(func):
-    """Только для создателя чата или глобального админа бота"""
+    """Только для создателя чата"""
     @wraps(func)
     def wrapper(message, *args, **kwargs):
         user_id = message.from_user.id
-        
-        if bot_admins.is_admin(user_id):
-            return func(message, *args, **kwargs)
         
         # Анонимный — не можем проверить, создатель ли он
         if user_id == ANONYMOUS_ADMIN_ID:
@@ -716,17 +725,19 @@ def get_settings_keyboard(chat_id: int) -> types.InlineKeyboardMarkup:
     antispam_status = "✅" if settings.get(chat_id, "antispam_enabled") else "❌"
     antilink_status = "✅" if settings.get(chat_id, "antilink_enabled") else "❌"
     welcome_status = "✅" if settings.get(chat_id, "welcome_enabled") else "❌"
+    goodbye_status = "✅" if settings.get(chat_id, "goodbye_enabled") else "❌"
     
     keyboard.add(
         types.InlineKeyboardButton(f"🔄 Анти-спам: {antispam_status}", callback_data="toggle_antispam"),
         types.InlineKeyboardButton(f"🔗 Анти-ссылки: {antilink_status}", callback_data="toggle_antilink"),
         types.InlineKeyboardButton(f"👋 Приветствия: {welcome_status}", callback_data="toggle_welcome"),
+        types.InlineKeyboardButton(f"🚪 Прощания: {goodbye_status}", callback_data="toggle_goodbye"),
         types.InlineKeyboardButton("🔙 Назад", callback_data="back_main")
     )
     return keyboard
 
 # ================================
-# Команды администратора бота
+# /myid
 # ================================
 @bot.message_handler(commands=["myid"])
 def cmd_myid(message):
@@ -738,107 +749,11 @@ def cmd_myid(message):
         parse_mode="Markdown"
     )
 
-@bot.message_handler(commands=["addowner"])
-def cmd_add_owner(message):
-    """
-    Секретная команда для первичной регистрации владельца.
-    Использование: /addowner <секретный_код>
-    
-    ⚠️ ВАЖНО: Измените SECRET_CODE перед использованием!
-    После добавления первого админа можно удалить эту команду.
-    """
-    SECRET_CODE = "SecretCode"  # ⚠️ ИЗМЕНИТЕ ЭТО!
-    
-    parts = message.text.split() if message.text else []
-    if len(parts) < 2:
-        return  # Молча игнорируем неполную команду
-    
-    if parts[1] != SECRET_CODE:
-        return  # Молча игнорируем неверный код
-    
-    user_id = message.from_user.id
-    
-    if bot_admins.add(user_id):
-        bot.reply_to(
-            message, 
-            f"✅ Вы добавлены как администратор бота!\n"
-            f"🆔 Ваш ID: `{user_id}`\n\n"
-            f"⚠️ Рекомендуется удалить команду /addowner из кода.",
-            parse_mode="Markdown"
-        )
-    else:
-        bot.reply_to(message, "ℹ️ Вы уже являетесь администратором бота")
-
-@bot.message_handler(commands=["addadmin"])
-@bot_admin_only
-def cmd_add_bot_admin(message):
-    """Добавить глобального администратора бота"""
-    parts = message.text.split() if message.text else []
-    if len(parts) < 2:
-        bot.reply_to(
-            message, 
-            "📝 Использование: `/addadmin <user_id>`\n\n"
-            "Узнать ID: пусть пользователь напишет боту /myid",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        user_id = int(parts[1])
-        if bot_admins.add(user_id):
-            bot.reply_to(message, f"✅ Пользователь `{user_id}` добавлен как администратор бота", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "⚠️ Этот пользователь уже является администратором")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Укажите числовой ID пользователя")
-
-@bot.message_handler(commands=["removeadmin"])
-@bot_admin_only
-def cmd_remove_bot_admin(message):
-    """Удалить глобального администратора бота"""
-    parts = message.text.split() if message.text else []
-    if len(parts) < 2:
-        bot.reply_to(message, "📝 Использование: `/removeadmin <user_id>`", parse_mode="Markdown")
-        return
-    
-    try:
-        user_id = int(parts[1])
-        
-        if user_id == message.from_user.id:
-            bot.reply_to(message, "⚠️ Нельзя удалить самого себя")
-            return
-        
-        if bot_admins.remove(user_id):
-            bot.reply_to(message, f"✅ Пользователь `{user_id}` удален из администраторов бота", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "⚠️ Этот пользователь не является администратором")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Укажите числовой ID пользователя")
-
-@bot.message_handler(commands=["listadmins"])
-@bot_admin_only
-def cmd_list_bot_admins(message):
-    """Список глобальных администраторов бота"""
-    admins = bot_admins.get_all()
-    
-    if not admins:
-        bot.reply_to(message, "📭 Список администраторов бота пуст")
-        return
-    
-    text = "👑 *Администраторы бота:*\n\n"
-    for i, admin_id in enumerate(admins, 1):
-        marker = " (вы)" if admin_id == message.from_user.id else ""
-        text += f"{i}. `{admin_id}`{marker}\n"
-    
-    bot.reply_to(message, text, parse_mode="Markdown")
-
 # ================================
 # Команды /start и /help
 # ================================
 @bot.message_handler(commands=["start", "help"])
 def cmd_help(message):
-    is_bot_admin = bot_admins.is_admin(message.from_user.id)
-    
     text = (
         "🤖 *Бот модерации*\n\n"
         "📋 *Основные команды:*\n"
@@ -856,19 +771,12 @@ def cmd_help(message):
         "❓ `/commands` — все команды"
     )
     
-    if is_bot_admin:
-        text += (
-            "\n\n👑 *Команды владельца:*\n"
-            "• `/addadmin` — добавить админа бота\n"
-            "• `/removeadmin` — удалить админа бота\n"
-            "• `/listadmins` — список админов бота"
-        )
-    
     bot.send_message(
         message.chat.id,
         text,
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        # ИСПРАВЛЕНИЕ: клавиатура имеет смысл только в группах
+        reply_markup=get_main_keyboard() if is_group(message) else None
     )
 
 # ================================
@@ -876,8 +784,6 @@ def cmd_help(message):
 # ================================
 @bot.message_handler(commands=["commands"])
 def cmd_all_commands(message):
-    is_bot_admin = bot_admins.is_admin(message.from_user.id)
-    
     text = """
 📋 *Полный список команд:*
 
@@ -913,18 +819,11 @@ def cmd_all_commands(message):
 *Настройки:*
 • `/settings` — настройки чата
 • `/setwelcome <текст>` — текст приветствия
+• `/setgoodbye <текст>` — текст прощания
 • `/setmaxwarns <N>` — макс. предупреждений
 """
     
-    if is_bot_admin:
-        text += """
-*👑 Команды владельца бота:*
-• `/addadmin <user_id>` — добавить админа
-• `/removeadmin <user_id>` — удалить админа
-• `/listadmins` — список админов
-"""
-    
-    text += "\n_Используйте reply или укажите @username/ID_"
+    text += "\n_Используйте reply или укажите ID пользователя_"
     
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
@@ -936,10 +835,11 @@ def callback_handler(call):
     chat_id = call.message.chat.id
     user_id = call.from_user.id
     
-    # Проверка прав: админ бота ИЛИ админ чата
-    has_access = bot_admins.is_admin(user_id)
-    if not has_access and not is_private(call.message):
-        has_access = is_chat_admin(chat_id, user_id)
+    # Проверка прав: админ чата (включая анонимного админа группы)
+    if is_private(call.message):
+        has_access = False
+    else:
+        has_access = can_moderate(chat_id, user_id)
     
     if not has_access:
         bot.answer_callback_query(call.id, "⛔ Нет доступа", show_alert=True)
@@ -1007,6 +907,16 @@ def callback_handler(call):
             settings.set(chat_id, "welcome_enabled", not current)
             status = 'включены' if not current else 'выключены'
             bot.answer_callback_query(call.id, f"Приветствия {status}")
+            bot.edit_message_reply_markup(
+                chat_id, call.message.message_id,
+                reply_markup=get_settings_keyboard(chat_id)
+            )
+        
+        elif call.data == "toggle_goodbye":
+            current = settings.get(chat_id, "goodbye_enabled")
+            settings.set(chat_id, "goodbye_enabled", not current)
+            status = 'включены' if not current else 'выключены'
+            bot.answer_callback_query(call.id, f"Прощания {status}")
             bot.edit_message_reply_markup(
                 chat_id, call.message.message_id,
                 reply_markup=get_settings_keyboard(chat_id)
@@ -1083,7 +993,7 @@ def cmd_addword(message):
         return
     
     if triggers.add(word):
-        bot.reply_to(message, f"✅ Добавлено: `{word.lower()}`", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Добавлено: `{md_escape(word.lower())}`", parse_mode="Markdown")
     else:
         bot.reply_to(message, "⚠️ Это слово уже в списке")
 
@@ -1108,7 +1018,7 @@ def cmd_delword(message):
     
     word = parts[1].strip()
     if triggers.remove(word):
-        bot.reply_to(message, f"✅ Удалено: `{word.lower()}`", parse_mode="Markdown")
+        bot.reply_to(message, f"✅ Удалено: `{md_escape(word.lower())}`", parse_mode="Markdown")
     else:
         bot.reply_to(message, "⚠️ Слово не найдено в списке")
 
@@ -1138,10 +1048,10 @@ def cmd_warn(message):
     user, reason = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/warn @user причина`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/warn <user_id> причина`", parse_mode="Markdown")
         return
     
-    if is_chat_admin(message.chat.id, user.id):
+    if user.id == ANONYMOUS_ADMIN_ID or is_chat_admin(message.chat.id, user.id):
         bot.reply_to(message, "⚠️ Нельзя выдать предупреждение админу чата")
         return
     
@@ -1153,8 +1063,8 @@ def cmd_warn(message):
     
     text = (
         f"⚠️ *Предупреждение*\n\n"
-        f"👤 Пользователь: {get_user_display(user)}\n"
-        f"📛 Причина: {reason}\n"
+        f"👤 Пользователь: {md_escape(get_user_display(user))}\n"
+        f"📛 Причина: {md_escape(reason)}\n"
         f"📊 Предупреждений: {count}/{max_warns}"
     )
     
@@ -1178,7 +1088,7 @@ def cmd_unwarn(message):
     user, _ = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/unwarn @user`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/unwarn <user_id>`", parse_mode="Markdown")
         return
     
     if warns.remove_warn(message.chat.id, user.id):
@@ -1194,7 +1104,7 @@ def cmd_warns(message):
     user, _ = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/warns @user`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/warns <user_id>`", parse_mode="Markdown")
         return
     
     user_warns = warns.get_warns(message.chat.id, user.id)
@@ -1203,10 +1113,10 @@ def cmd_warns(message):
         bot.reply_to(message, f"✅ У {get_user_display(user)} нет предупреждений")
         return
     
-    text = f"📋 *Предупреждения {get_user_display(user)}:*\n\n"
+    text = f"📋 *Предупреждения {md_escape(get_user_display(user))}:*\n\n"
     for i, w in enumerate(user_warns, 1):
         date = datetime.fromisoformat(w['date']).strftime("%d.%m.%Y")
-        text += f"{i}. {w['reason']} ({date})\n"
+        text += f"{i}. {md_escape(w['reason'])} ({date})\n"
     
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
@@ -1217,7 +1127,7 @@ def cmd_clearwarns(message):
     user, _ = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/clearwarns @user`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/clearwarns <user_id>`", parse_mode="Markdown")
         return
     
     count = warns.clear_warns(message.chat.id, user.id)
@@ -1242,7 +1152,7 @@ def cmd_mute(message):
         if len(parts) < 2:
             bot.reply_to(
                 message, 
-                "📝 Ответьте на сообщение или: `/mute @user [время]`\n"
+                "📝 Ответьте на сообщение или: `/mute <user_id> [время]`\n"
                 "Время: 1m, 1h, 1d, 1w",
                 parse_mode="Markdown"
             )
@@ -1255,7 +1165,7 @@ def cmd_mute(message):
         bot.reply_to(message, "❌ Пользователь не найден")
         return
     
-    if is_chat_admin(message.chat.id, user.id):
+    if user.id == ANONYMOUS_ADMIN_ID or is_chat_admin(message.chat.id, user.id):
         bot.reply_to(message, "⚠️ Нельзя замутить админа чата")
         return
     
@@ -1295,7 +1205,7 @@ def cmd_unmute(message):
     user, _ = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/unmute @user`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/unmute <user_id>`", parse_mode="Markdown")
         return
     
     try:
@@ -1320,10 +1230,10 @@ def cmd_ban(message):
     user, reason = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/ban @user [причина]`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/ban <user_id> [причина]`", parse_mode="Markdown")
         return
     
-    if is_chat_admin(message.chat.id, user.id):
+    if user.id == ANONYMOUS_ADMIN_ID or is_chat_admin(message.chat.id, user.id):
         bot.reply_to(message, "⚠️ Нельзя забанить админа чата")
         return
     
@@ -1344,18 +1254,16 @@ def cmd_ban(message):
 @group_only
 @admin_only
 def cmd_unban(message):
-    parts = message.text.split() if message.text else []
-    if len(parts) < 2:
-        bot.reply_to(message, "📝 Использование: `/unban <user_id>`", parse_mode="Markdown")
+    # ИСПРАВЛЕНИЕ: работает как остальные команды — reply, ID или text_mention
+    user, _ = extract_user_from_message(message)
+    
+    if not user:
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/unban <user_id>`", parse_mode="Markdown")
         return
     
     try:
-        user_id = int(parts[1])
-        bot.unban_chat_member(message.chat.id, user_id, only_if_banned=True)
-        bot.reply_to(message, f"✅ Пользователь `{user_id}` разбанен", parse_mode="Markdown")
-        
-    except ValueError:
-        bot.reply_to(message, "⚠️ Укажите числовой ID пользователя")
+        bot.unban_chat_member(message.chat.id, user.id, only_if_banned=True)
+        bot.reply_to(message, f"✅ Пользователь `{user.id}` разбанен", parse_mode="Markdown")
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
 
@@ -1366,10 +1274,10 @@ def cmd_kick(message):
     user, _ = extract_user_from_message(message)
     
     if not user:
-        bot.reply_to(message, "📝 Ответьте на сообщение или: `/kick @user`", parse_mode="Markdown")
+        bot.reply_to(message, "📝 Ответьте на сообщение или: `/kick <user_id>`", parse_mode="Markdown")
         return
     
-    if is_chat_admin(message.chat.id, user.id):
+    if user.id == ANONYMOUS_ADMIN_ID or is_chat_admin(message.chat.id, user.id):
         bot.reply_to(message, "⚠️ Нельзя кикнуть админа чата")
         return
     
@@ -1408,16 +1316,14 @@ def cmd_userinfo(message):
         }
         
         user_warns_count = warns.count_warns(message.chat.id, user.id)
-        is_bot_admin_status = "✅" if bot_admins.is_admin(user.id) else "❌"
         
         text = (
             f"👤 *Информация о пользователе*\n\n"
             f"├ ID: `{user.id}`\n"
-            f"├ Имя: {user.first_name or 'N/A'}\n"
-            f"├ Фамилия: {user.last_name or 'N/A'}\n"
-            f"├ Username: @{user.username or 'N/A'}\n"
+            f"├ Имя: {md_escape(user.first_name or 'N/A')}\n"
+            f"├ Фамилия: {md_escape(user.last_name or 'N/A')}\n"
+            f"├ Username: @{md_escape(user.username or 'N/A')}\n"
             f"├ Статус в чате: {status_map.get(member.status, member.status)}\n"
-            f"├ Админ бота: {is_bot_admin_status}\n"
             f"├ Бот: {'Да' if user.is_bot else 'Нет'}\n"
             f"└ Предупреждений: {user_warns_count}"
         )
@@ -1502,12 +1408,18 @@ def cmd_clear(message):
             except Exception:
                 continue
         
+        # ИСПРАВЛЕНИЕ: учитываем удалённые сообщения в статистике
+        stats.increment(message.chat.id, "deleted_messages", deleted)
+        
         msg = bot.send_message(message.chat.id, f"🗑️ Удалено сообщений: {deleted}")
-        time.sleep(3)
-        try:
-            bot.delete_message(message.chat.id, msg.message_id)
-        except Exception:
-            pass
+        # ИСПРАВЛЕНИЕ: удаление уведомления в отдельном таймере (было time.sleep(3),
+        # блокировавшее поток обработки)
+        def _delete_notification():
+            try:
+                bot.delete_message(message.chat.id, msg.message_id)
+            except Exception:
+                pass
+        threading.Timer(3.0, _delete_notification).start()
         
     except ValueError:
         bot.reply_to(message, "⚠️ Укажите число")
@@ -1604,6 +1516,26 @@ def cmd_setwelcome(message):
     settings.set(message.chat.id, "welcome_enabled", True)
     bot.reply_to(message, "✅ Приветствие обновлено и включено")
 
+@bot.message_handler(commands=["setgoodbye"])
+@group_only
+@admin_only
+def cmd_setgoodbye(message):
+    parts = message.text.split(maxsplit=1) if message.text else []
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "📝 Использование: `/setgoodbye <текст>`\n\n"
+            "Переменные:\n"
+            "• `{user}` — имя пользователя\n"
+            "• `{chat}` — название чата",
+            parse_mode="Markdown"
+        )
+        return
+    
+    settings.set(message.chat.id, "goodbye_message", parts[1])
+    settings.set(message.chat.id, "goodbye_enabled", True)
+    bot.reply_to(message, "✅ Текст прощания обновлён и включён")
+
 # ================================
 # Обработка новых/ушедших участников
 # ================================
@@ -1644,18 +1576,12 @@ def handle_left_member(message):
 def handle_message(message):
     # Личные сообщения
     if is_private(message):
-        is_bot_admin_user = bot_admins.is_admin(message.from_user.id)
-        
         text = (
             "👋 Привет! Я бот модерации для групп.\n\n"
             "📌 Добавьте меня в группу и дайте права администратора.\n\n"
             "/help — список команд\n"
             "/myid — узнать свой ID"
         )
-        
-        if is_bot_admin_user:
-            text += "\n\n👑 Вы — администратор бота"
-        
         bot.send_message(message.chat.id, text)
         return
     
@@ -1671,8 +1597,8 @@ def handle_message(message):
         bot.send_message(chat_id, "✅ Работаю!")
         return
     
-    # Пропуск админов чата и бота
-    if is_chat_admin(chat_id, user_id) or bot_admins.is_admin(user_id):
+    # Пропуск админов чата (включая анонимных)
+    if can_moderate(chat_id, user_id):
         return
     
     # Анти-спам
@@ -1757,14 +1683,8 @@ def main():
     print("=" * 50)
     print("🤖 Бот модерации запущен!")
     print(f"📁 Триггер-слова: {triggers.count()}")
-    print(f"👑 Админов бота: {bot_admins.count()}")
     print(f"📁 Логи: {LOG_PATH}")
     print("=" * 50)
-    
-    if bot_admins.count() == 0:
-        print("\n⚠️  ВНИМАНИЕ: Нет администраторов бота!")
-        print("   Используйте команду /addowner <секретный_код>")
-        print("   для добавления первого администратора.\n")
     
     while True:
         try:

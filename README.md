@@ -32,7 +32,6 @@ A powerful and flexible Telegram moderation bot with advanced admin tools, anti-
 - Blocked spam and links
 
 ### Permission System
-- Global bot administrators
 - Chat administrators
 - Chat creator
 - Protection from anonymous admin abuse
@@ -63,4 +62,4 @@ nano token.txt
 nano trigger.txt
 
 ### 5. follow the command line instructions
-If it doesn't work, let me know in issules
+If it doesn't work, let me know in issues

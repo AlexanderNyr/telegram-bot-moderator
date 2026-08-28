@@ -1,0 +1,11 @@
+# Служебные данные бота (не коммитить)
+log.txt
+log.txt.old
+warns.json
+admins.json
+triggers_*.txt
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
